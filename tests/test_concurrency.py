@@ -105,3 +105,72 @@ def test_concurrent_stance_submits_serialize_with_snapshot(client):
     assert codes.count(200) == 7
     hist = client.get("/cargo/CS/responsibilities/m1/stances").json()
     assert len(hist["history"]) == 1
+
+
+def test_concurrent_vehicle_reading_and_own_measurement_serialize(client):
+    """车载读数写入与受影响货物的自有测温写入共用货物行锁：
+
+    同刻（11:00）并发提交车载越温读数与货物自有不超限测温，二者都应成功，
+    且无论提交先后，重建结果确定：同刻自有测温优先，货物不越温；
+    车次读数查询对该货物标记 adopted=false（原始读数仍可查）。
+    """
+    client.post(
+        "/cargo",
+        json={
+            "cargo_id": "CV",
+            "started_at": "2026-01-01T10:00:00+00:00",
+            "temp_upper_limit": "5",
+            "initial_holder": "A",
+        },
+    )
+    assert client.post("/trips", json={"trip_id": "TV", "vehicle_no": "V"}).status_code == 201
+    assert client.post(
+        "/trips/TV/manifest",
+        json={"items": [{
+            "cargo_id": "CV",
+            "loaded_at": "2026-01-01T10:00:00+00:00",
+            "unloaded_at": "2026-01-01T12:00:00+00:00",
+        }]},
+    ).status_code == 201
+
+    def submit_own(i):
+        # 只有一笔使用合法编号，其余预期冲突/失败，仅用于制造并发压力
+        return client.post(
+            "/events",
+            json={
+                "event_id": "m-own" if i == 0 else f"m-own-x{i}",
+                "cargo_id": "CV",
+                "occurred_at": "2026-01-01T11:00:00+00:00",
+                "temperature": "3",
+            },
+        ).status_code
+
+    def submit_vehicle(i):
+        return client.post(
+            "/vehicle-readings",
+            json={
+                "reading_id": f"vr{i}",
+                "trip_id": "TV",
+                "read_at": "2026-01-01T11:00:00+00:00",
+                "temperature": "9",
+            },
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(submit_own, range(4)))
+        list(pool.map(submit_vehicle, range(4)))
+
+    # 自有测温只有一笔（m-own），车载读数同车次同刻只有一笔
+    own = client.get("/cargo/CV/events").json()
+    assert [e["event_id"] for e in own] == ["m-own"]
+    trip = client.get("/trips/TV").json()
+    assert len(trip["readings"]) == 1
+    app_cv = next(a for a in trip["readings"][0]["applications"] if a["cargo_id"] == "CV")
+    assert app_cv["adopted"] is False  # 同刻自有测温优先
+    assert app_cv["on_board"] is True
+    # 采用自有值 3℃ -> 无越温区间
+    assert client.get("/cargo/CV/report").json()["excursions"] == []
+    # 车载原始读数仍可查（合并时间线中 adopted=false）
+    tl = client.get("/cargo/CV/timeline").json()["points"]
+    veh = [p for p in tl if p["source"] == "vehicle"]
+    assert len(veh) == 1 and veh[0]["adopted"] is False

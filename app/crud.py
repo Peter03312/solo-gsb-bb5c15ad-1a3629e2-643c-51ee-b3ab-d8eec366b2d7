@@ -22,6 +22,10 @@ from app.models import Cargo, Event, EventType
 from app.schemas import CargoCreate, EventCreate
 from app.timeutil import ensure_utc
 
+# 车载读数开启区间的标识前缀（veh:<reading_id>）被保留，
+# 货物自有事件ID不得此前缀，以免与车载区间标识冲突
+_RESERVED_EVENT_PREFIX = "veh:"
+
 
 class ApiError(Exception):
     """业务校验错误，由路由层映射为 HTTP 状态码。"""
@@ -107,37 +111,34 @@ def _same_content(existing: Event, candidate: Event) -> bool:
 def _validate_prospective(cargo: Cargo, events: list[Event]) -> None:
     """对“既有事件 + 候选事件”做整链校验，不合法即抛 ApiError。"""
     holder = cargo.initial_holder
+    points = chain._sorted_events(events)
 
     # 1) 沿事件流模拟保管链：交出方必须等于交接时刻的当前保管方
     #    （晚到的插入若使既有交接失效，同样整体拒绝）
-    for e in chain._sorted_events(events):
-        if e.event_type is EventType.handover:
-            if e.giver != holder:
+    for p in points:
+        if p.is_handover:
+            if p.giver != holder:
                 raise _unprocessable(
-                    f"交接 {e.event_id} 的交出方 {e.giver} 不是 "
-                    f"{e.occurred_at.isoformat()} 时刻的保管方 {holder}，"
+                    f"交接 {p.source_id} 的交出方 {p.giver} 不是 "
+                    f"{p.occurred_at.isoformat()} 时刻的保管方 {holder}，"
                     "写入被整体拒绝",
                     code="giver_mismatch",
                 )
-            holder = e.receiver
+            holder = p.receiver
 
     # 2) 同一货物同一时刻同类型事件冲突（测温/交接互不冲突）
     seen_measure_at: set = set()
     seen_handover_at: set = set()
-    for e in chain._sorted_events(events):
-        bucket = (
-            seen_measure_at
-            if e.event_type is EventType.measurement
-            else seen_handover_at
-        )
-        if e.occurred_at in bucket:
+    for p in points:
+        bucket = seen_measure_at if p.is_measurement else seen_handover_at
+        if p.occurred_at in bucket:
             raise _conflict(
-                f"货物 {cargo.cargo_id} 在 {e.occurred_at.isoformat()} "
-                f"已存在一笔{'测温' if e.event_type is EventType.measurement else '交接'}，"
+                f"货物 {cargo.cargo_id} 在 {p.occurred_at.isoformat()} "
+                f"已存在一笔{'测温' if p.is_measurement else '交接'}，"
                 "同一时刻不允许重复",
                 code="same_timestamp_conflict",
             )
-        bucket.add(e.occurred_at)
+        bucket.add(p.occurred_at)
 
 
 def create_event(db, payload: EventCreate) -> WriteResult:
@@ -145,6 +146,13 @@ def create_event(db, payload: EventCreate) -> WriteResult:
         etype = payload.event_type()
     except ValueError as exc:
         raise _unprocessable(str(exc), code="bad_event_shape")
+
+    if payload.event_id.startswith(_RESERVED_EVENT_PREFIX):
+        raise _unprocessable(
+            f"事件ID {payload.event_id!r} 以保留前缀 "
+            f"{_RESERVED_EVENT_PREFIX!r} 开头（用于车载读数区间标识），请更换编号",
+            code="reserved_event_id",
+        )
 
     occurred_at = ensure_utc(payload.occurred_at)
     candidate = Event(

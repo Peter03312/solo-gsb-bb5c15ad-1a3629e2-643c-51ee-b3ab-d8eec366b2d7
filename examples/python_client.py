@@ -190,6 +190,140 @@ def main() -> None:
             api.get(f"/cargo/{CARGO}/responsibilities/{iid}"),
         )
 
+        # ==================== 车次 / 装卸时段 / 车载测温 ====================
+        trip = "TRUCK-PY-1"
+        cargo_a = "COLD-CAR-A"
+        cargo_b = "COLD-CAR-B"
+        for cid, limit in ((cargo_a, "4.0"), (cargo_b, "8.0")):
+            api.post(
+                "/cargo",
+                json={
+                    "cargo_id": cid,
+                    "started_at": "2026-09-30T08:00:00+08:00",
+                    "temp_upper_limit": limit,
+                    "initial_holder": "北京冷库",
+                },
+            )
+
+        show(
+            "登记车次",
+            api.post("/trips", json={
+                "trip_id": trip, "vehicle_no": "京B-冷888", "note": "京沪班"}),
+        )
+
+        # 批量登记装卸时段（原子：左闭右开、同货物不得跨车次重叠，否则整批拒绝）
+        show(
+            "批量登记装卸时段",
+            api.post(
+                f"/trips/{trip}/manifest",
+                json={"items": [
+                    {"cargo_id": cargo_a,
+                     "loaded_at": "2026-09-30T09:00:00+08:00",
+                     "unloaded_at": "2026-09-30T18:00:00+08:00"},
+                    {"cargo_id": cargo_b,
+                     "loaded_at": "2026-09-30T09:00:00+08:00",
+                     "unloaded_at": "2026-09-30T18:00:00+08:00"},
+                ]},
+            ),
+        )
+
+        # 非法时段（起点不早于终点）-> 422，整批不留记录
+        show(
+            "非法装卸时段（整体拒绝）",
+            api.post(
+                f"/trips/{trip}/manifest",
+                json={"items": [
+                    {"cargo_id": cargo_a,
+                     "loaded_at": "2026-09-30T19:00:00+08:00",
+                     "unloaded_at": "2026-09-30T19:00:00+08:00"},
+                ]},
+            ),
+        )
+
+        # 车载 7℃：对上限 4℃ 的 A 越温，对上限 8℃ 的 B 不越温
+        show(
+            "车载读数 7℃（回执含受影响货物）",
+            api.post(
+                "/vehicle-readings",
+                json={"reading_id": "py-vr1", "trip_id": trip,
+                      "read_at": "2026-09-30T10:00:00+08:00",
+                      "temperature": "7.0"},
+            ),
+        )
+        # 同编号同内容重传 -> 200 replayed
+        show(
+            "车载读数幂等重传",
+            api.post(
+                "/vehicle-readings",
+                json={"reading_id": "py-vr1", "trip_id": trip,
+                      "read_at": "2026-09-30T10:00:00+08:00",
+                      "temperature": "7.0"},
+            ),
+        )
+
+        # 11:00：货物 A 有自有测温 3.1℃，车载 7℃ 被取代（原始仍可查）
+        api.post(
+            "/events",
+            json={"event_id": "py-ca-own1", "cargo_id": cargo_a,
+                  "occurred_at": "2026-09-30T11:00:00+08:00",
+                  "temperature": "3.1"},
+        )
+        show(
+            "同刻车载读数（对 A 被自有测温取代）",
+            api.post(
+                "/vehicle-readings",
+                json={"reading_id": "py-vr2", "trip_id": trip,
+                      "read_at": "2026-09-30T11:00:00+08:00",
+                      "temperature": "7.0"},
+            ),
+        )
+
+        # 交接仍只由货物自有事件改变保管方
+        for cid, hid in ((cargo_a, "py-ca-h1"), (cargo_b, "py-cb-h1")):
+            api.post(
+                "/events",
+                json={"event_id": hid, "cargo_id": cid,
+                      "occurred_at": "2026-09-30T12:00:00+08:00",
+                      "giver": "北京冷库", "receiver": "上海冷库"},
+            )
+
+        # 车载 3℃ 闭合 A 的区间
+        show(
+            "车载 3℃ 闭合区间",
+            api.post(
+                "/vehicle-readings",
+                json={"reading_id": "py-vr3", "trip_id": trip,
+                      "read_at": "2026-09-30T14:00:00+08:00",
+                      "temperature": "3.0"},
+            ),
+        )
+
+        show("车次详情（读数 + 各货物适用性 / 采用 / 越温）", api.get(f"/trips/{trip}"))
+        show("货物 A 合并读数时间线（vr2 adopted=false）",
+             api.get(f"/cargo/{cargo_a}/timeline"))
+        show("货物 A 追责报告（区间 veh:py-vr1，车载开启/闭合）",
+             api.get(f"/cargo/{cargo_a}/report"))
+        show("货物 B 追责报告（7℃ 不超其 8℃ 上限，无越温）",
+             api.get(f"/cargo/{cargo_b}/report"))
+
+        # 对车载读数开启的区间表态：区间标识 veh:<读数ID>
+        ivs = api.get(f"/cargo/{cargo_a}/responsibilities").json().get("intervals", [])
+        if ivs:
+            viid, vsnap = ivs[0]["interval_id"], ivs[0]["snapshot_id"]
+            print(f"车载区间标识={viid} 快照={vsnap}")
+            show(
+                "北京冷库对车载区间确认",
+                api.post(
+                    f"/cargo/{cargo_a}/responsibilities/{viid}/stances",
+                    json={"snapshot_id": vsnap,
+                          "responsible_party": "北京冷库",
+                          "stance": "confirm",
+                          "stance_id": "py-stance-ca-1"},
+                ),
+            )
+            show("车载区间表态历史",
+                 api.get(f"/cargo/{cargo_a}/responsibilities/{viid}/stances"))
+
 
 if __name__ == "__main__":
     main()

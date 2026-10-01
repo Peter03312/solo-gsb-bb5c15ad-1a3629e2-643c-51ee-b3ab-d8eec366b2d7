@@ -1,6 +1,8 @@
 # 冷链货物追责服务
 
-面向冷链货物追责的后端服务：录入货物与测温 / 交接事件，**按发生时间重建保管链**，自动识别越温区间并在交接时刻拆分责任。技术栈 **Python 3.11 + FastAPI + SQLAlchemy 2 + PostgreSQL**。
+面向冷链货物追责的后端服务：录入货物与**自有测温 / 交接事件**、**冷链车次、每票货物的装卸时段与车载测温读数**，在**合并读数时间线**上按发生时间重建保管链，自动识别越温区间并在交接时刻拆分责任。技术栈 **Python 3.11 + FastAPI + SQLAlchemy 2 + PostgreSQL**。
+
+车载测温（本轮）：同一冷链车承载多票货物时，可登记车次、每票货物的装卸时段（左闭右开）与车载探头读数；车载读数仅作用于读数时刻仍在车上的货物，并按**各自温度上限**判断越温；同刻有货物自有测温时**优先采用自有值**（车载原始读数仍可查）；交接仍只由货物自有事件改变保管方。
 
 ## 一、一键启动（Docker Compose，含数据库初始化）
 
@@ -60,13 +62,19 @@ uvicorn app.main:app --reload --port 8000
 | `POST` | `/cargo` | 创建货物 |
 | `GET` | `/cargo` | 货物列表 |
 | `GET` | `/cargo/{cargo_id}` | 货物详情 |
-| `POST` | `/events` | 写入测温 / 交接事件 |
-| `GET` | `/cargo/{cargo_id}/events` | 按发生时间列出事件 |
-| `GET` | `/cargo/{cargo_id}/report` | **追责报告**：越温区间 + 责任片段 |
+| `POST` | `/events` | 写入货物**自有**测温 / 交接事件 |
+| `GET` | `/cargo/{cargo_id}/events` | 按发生时间列出**自有事件**（不含车载读数） |
+| `GET` | `/cargo/{cargo_id}/report` | **追责报告**：越温区间（含读数来源）+ 责任片段 |
+| `GET` | `/cargo/{cargo_id}/timeline` | **合并读数时间线**：自有事件 + 适用的车载读数（含被取代点） |
 | `GET` | `/cargo/{cargo_id}/responsibilities` | **责任确认**：全部已闭合区间的确认状态 |
 | `GET` | `/cargo/{cargo_id}/responsibilities/{interval_id}` | 单个已闭合区间的责任确认视图 |
 | `POST` | `/cargo/{cargo_id}/responsibilities/{interval_id}/stances` | 提交责任方表态（确认 / 异议） |
 | `GET` | `/cargo/{cargo_id}/responsibilities/{interval_id}/stances` | 区间历次表态历史（含已改口 / 已失效） |
+| `POST` | `/trips` | 登记车次 |
+| `GET` | `/trips` | 车次列表 |
+| `GET` | `/trips/{trip_id}` | 车次详情：装卸时段、车载原始读数及对各货物的适用性 |
+| `POST` | `/trips/{trip_id}/manifest` | 批量登记车次上各票货物的装卸时段（原子） |
+| `POST` | `/vehicle-readings` | 写入车载测温读数（允许晚到；幂等 / 冲突） |
 | `GET` | `/health` | 健康检查 |
 
 ### 1. 创建货物 `POST /cargo`
@@ -103,6 +111,83 @@ uvicorn app.main:app --reload --port 8000
 
 每个事件都带 **事件ID、货物编号、发生时间**。
 
+### 2.1 登记车次 `POST /trips`
+
+```json
+{ "trip_id": "TRUCK-1", "vehicle_no": "京B-冷888", "note": "京沪冷链班" }
+```
+
+车次编号重复返回 `409 trip_exists`，车次不存在返回 `404 trip_not_found`。
+
+### 2.2 登记装卸时段 `POST /trips/{trip_id}/manifest`
+
+一个车次承载多票货物时，**批量**登记每票货物的装卸时段：
+
+```json
+{
+  "items": [
+    { "cargo_id": "COLD-001",
+      "loaded_at": "2026-09-30T09:00:00+08:00",
+      "unloaded_at": "2026-09-30T18:00:00+08:00" },
+    { "cargo_id": "COLD-002",
+      "loaded_at": "2026-09-30T09:00:00+08:00",
+      "unloaded_at": "2026-09-30T18:00:00+08:00" }
+  ]
+}
+```
+
+* 时段**左闭右开** `[loaded_at, unloaded_at)`，且起点必须**严格早于**终点，否则
+  `422 invalid_loading_window`；
+* 同一货物的装卸时段不得与任意车次的既有时段重叠（首尾相接可以）——重叠即“同货物同时
+  属于两个车次”，返回 `409 loading_overlap`；同批内重叠同样拒绝；
+* 货物或车次不存在分别返回 `404 cargo_not_found` / `404 trip_not_found`；
+* 本接口为**批量原子**操作：任一条非法整批拒绝，**不留任何部分记录**。
+
+### 2.3 写入车载测温读数 `POST /vehicle-readings`
+
+```json
+{
+  "reading_id": "vr-1",
+  "trip_id": "TRUCK-1",
+  "read_at": "2026-09-30T10:00:00+08:00",
+  "temperature": "7.0"
+}
+```
+
+读数是车次探头的**原始读数**，写入**允许晚到**（乱序补录）。回执给出读数时刻仍在车上、
+按各自温度上限受影响的货物：
+
+```json
+{ "reading": { "reading_id": "vr-1", "trip_id": "TRUCK-1",
+               "read_at": "2026-09-30T02:00:00Z", "temperature": "7.000", "…": "…" },
+  "affected_cargo_ids": ["COLD-001"] }
+```
+
+* 读数仅作用于读数时刻仍在**同一车次**车上的货物
+  （`loaded_at ≤ read_at < unloaded_at`，左闭右开），与该货物无关的车次读数不入其时间线；
+* 同车次同一时刻至多一笔读数：冲突 `409 same_timestamp_conflict`；
+* 编号幂等：`reading_id` **同内容**重传返回 `200 {"replayed": true, …}`（仍给出受影响货物），
+  **异内容**返回 `409 reading_id_conflict`，原记录不变；车次不存在 `404 trip_not_found`；
+* 读数时刻车上无货物时读数**仍正常入库**（原始可查），仅 `affected_cargo_ids` 为空。
+
+### 2.4 车次详情 `GET /trips/{trip_id}`
+
+返回车次信息、全部装卸时段，以及车载原始读数；每笔读数对车次上**每票已登记货物**给出：
+
+| 字段 | 含义 |
+| --- | --- |
+| `on_board` | 读数时刻该货物是否仍在车上（左闭右开边界） |
+| `adopted` | 是否被该货物越温时间线**采用**（在车上且同刻无自有测温） |
+| `over_limit` | 按**该货物自身温度上限**判断是否越温；不在车上时为 `null` |
+| `reason` | `adopted` 已采用 / `not_on_board` 不在车上 / `supplanted_by_own` 同刻有自有测温被取代 |
+
+### 2.5 货物读数时间线 `GET /cargo/{cargo_id}/timeline`
+
+返回该货物的**合并读数时间线**（按时间）：货物自有测温 / 交接，以及对其适用的车载原始读数。
+每个点带 `source`（`own` / `vehicle`）、`event_id` / `reading_id` / `trip_id`、
+`adopted`（车载点同刻被自有测温取代时为 `false`，原始读数仍列出）、
+`changes_holder`（仅自有交接为 `true`——车载读数不改变保管方）。
+
 ### 3. 追责报告 `GET /cargo/{cargo_id}/report`
 
 ```json
@@ -119,7 +204,14 @@ uvicorn app.main:app --reload --port 8000
         { "start": "2026-09-30T02:00:00Z", "end": "2026-09-30T04:00:00Z", "responsible_party": "北京冷库" },
         { "start": "2026-09-30T04:00:00Z", "end": "2026-09-30T06:00:00Z", "responsible_party": "上海冷库" },
         { "start": "2026-09-30T06:00:00Z", "end": "2026-09-30T08:00:00Z", "responsible_party": "广州冷库" }
-      ]
+      ],
+      "interval_id": "evt-temp-1",
+      "start_source": "own",
+      "end_source": "vehicle",
+      "start_reading_id": null,
+      "end_reading_id": "vr-2",
+      "start_trip_id": null,
+      "end_trip_id": "TRUCK-1"
     }
   ]
 }
@@ -127,9 +219,18 @@ uvicorn app.main:app --reload --port 8000
 
 未闭合区间：`end` 为 `null`、`is_open` 为 `true`，最后一个责任片段的 `end` 也是 `null`（未结束）。区间与片段均按时间升序返回。
 
+区间的读数来源字段：
+
+* `interval_id`：区间**稳定标识**——货物自有测温开启=测温事件ID（如 `evt-temp-1`）；
+  **车载读数开启=`veh:<读数ID>`**（如 `veh:vr-1`），供责任查询与表态长期引用；
+* `start_source` / `end_source`：开启 / 闭合读数来源 `own`（自有测温）或 `vehicle`（车载读数）；
+  开放区间无闭合来源；
+* `start_reading_id` / `end_reading_id`（车载时）、`start_trip_id` / `end_trip_id`（所属车次）；
+  自有测温时读数ID字段为 `null`、事件坐标见责任确认视图的 `start_event_id` / `end_event_id`。
+
 ### 4. 责任确认 `GET /cargo/{cargo_id}/responsibilities[/{interval_id}]`
 
-围绕**已闭合**越温区间开展责任确认（开放区间不参与）。区间以**开启测温事件ID**作为区间标识（`interval_id` / `start_event_id`），响应同时给出结束测温事件ID、责任片段、**当前快照标识**、各责任方最新一条有效表态与汇总状态。
+围绕**已闭合**越温区间开展责任确认（开放区间不参与）。区间以**稳定区间标识** `interval_id` 定位：货物自有测温开启时等于开启测温事件ID，车载读数开启时为 `veh:<读数ID>`。响应同时给出开启 / 闭合读数来源（自有 / 车载）与事件 / 读数坐标、结束测温事件ID（自有闭合时）、责任片段、**当前快照标识**、各责任方最新一条有效表态与汇总状态。
 
 ```json
 {
@@ -213,19 +314,24 @@ uvicorn app.main:app --reload --port 8000
 7. **幂等**：同一 `event_id` 重传：内容完全一致（时间按同一时刻归一化比较）返回 `200 {"replayed": true}` 且不重复写入；内容不一致返回 `409 event_id_conflict`，原记录不变。
 8. **并发**：同一货物的写入在事务中以 `SELECT ... FOR UPDATE` 锁定货物行串行化，并由部分唯一索引 / CHECK 约束在数据库层兜底。**责任表态提交与事件写入共用同一把货物行锁**，二者对同一货物严格串行。
 9. **责任确认（仅已闭合区间）**：
-   - 区间标识 = 开启区间的测温事件ID；快照标识由区间起止与责任片段序列的 SHA-256 决定；
+   - 区间标识 = 开启区间的稳定标识：货物自有测温开启=测温事件ID；**车载读数开启=`veh:<reading_id>`**；快照标识由区间起止与责任片段序列的 SHA-256 决定（与读数来源无关，只取决于时间坐标与责任方）；
    - 表态为只追加记录：同编号同内容重传返回原记录（快照失效亦然），同编号异内容冲突，改口必须用新编号且历次表态保留；
    - 新表态以当前快照校验（过期拒绝），责任方必须在当前片段中；区间不存在 / 开放均拒绝且不落库；
-   - 晚到事件重建后：边界或责任片段变化的旧表态失效、未变化片段上的表态继续有效，全部历史仍可查。
+   - 晚到事件 / 晚到车载读数重建后：区间标识变化（开启读数被自有测温取代等）、边界或责任片段变化的旧表态失效、未变化片段上的表态继续有效，全部历史仍可查。
+10. **车次与装卸时段**：同一冷链车可承载多票货物；装卸时段左闭右开 `[loaded_at, unloaded_at)` 且起点严格早于终点；同一货物的时段不得跨车次（或同批）重叠，首尾相接允许；登记为批量原子操作，任一非法整批拒绝、不留部分记录。
+11. **车载读数适用性**：车载读数只作用于读数时刻仍在**同一车次**车上的货物（`loaded_at ≤ t < unloaded_at`）；同一读数对不同货物按**各自温度上限**分别判断越温，互不影响；读数不改变任何货物的保管方，保管方只由自有交接改变。
+12. **读数来源优先**：同一时刻货物有自有测温时采用**自有值**，该时刻车载读数对该货物标记为“已取代”、不参与越温重建，但**原始读数仍可查**（车次详情与货物时间线均保留）。
+13. **车载读数晚到与幂等**：读数允许乱序写入，写入后对全部受影响货物的时间线按时刻整体重建；`reading_id` 同内容重传幂等、异内容冲突；同车次同刻至多一笔读数。
+14. **串行一致性**：车载读数写入在单事务内**先按 cargo_id 升序锁定全部受影响货物行、再锁定车次行**，与这些货物的自有事件写入、责任表态严格串行（与装卸登记、同车次读数写入也经车次行锁串行），校验与重建所见必为持锁期间的最新时间线。
 
 错误响应统一格式：`{"error": {"code": "...", "message": "..."}}`。
 
 | HTTP | code | 触发场景 |
 | --- | --- | --- |
-| 404 | `cargo_not_found` / `interval_not_found` | 货物或已闭合区间不存在 |
-| 409 | `cargo_exists` / `event_id_conflict` / `same_timestamp_conflict` / `integrity_conflict` / `stance_id_conflict` / `stale_snapshot` | 编号或同刻冲突、表态编号冲突、快照过期 |
-| 422 | `before_start` / `giver_mismatch` / `bad_event_shape` / `interval_open` / `party_not_in_segment` / `bad_stance_shape` / `dispute_reason_required` | 业务校验失败（整体拒绝、不落库） |
-| 200 | 响应体 `replayed=true` | 事件 / 表态同 ID 同内容幂等重传 |
+| 404 | `cargo_not_found` / `interval_not_found` / `trip_not_found` | 货物、已闭合区间或车次不存在 |
+| 409 | `cargo_exists` / `trip_exists` / `event_id_conflict` / `same_timestamp_conflict` / `integrity_conflict` / `stance_id_conflict` / `stale_snapshot` / `reading_id_conflict` / `loading_overlap` | 编号或同刻冲突、表态编号冲突、快照过期、装卸跨车次重叠 |
+| 422 | `before_start` / `giver_mismatch` / `bad_event_shape` / `interval_open` / `party_not_in_segment` / `bad_stance_shape` / `dispute_reason_required` / `invalid_loading_window` / `reserved_event_id` | 业务校验失败（整体拒绝、不落库） |
+| 200 | 响应体 `replayed=true` | 事件 / 表态 / 车载读数同 ID 同内容幂等重传 |
 
 ## 六、调用示例
 
@@ -244,12 +350,12 @@ python examples/python_client.py
 ```bash
 pip install pytest httpx
 
-pytest -q                                          # 52 个用例（内存库），并发用例自动跳过
+pytest -q                                          # 76 个用例（内存库），并发用例自动跳过
 DATABASE_URL="sqlite:////tmp/cc.db" \
-  pytest tests/test_concurrency.py -q              # 2 个并发串行化用例（事件 / 表态，需文件型库）
+  pytest tests/test_concurrency.py -q              # 3 个并发串行化用例（事件 / 表态 / 车载读数，需文件型库）
 ```
 
-测试覆盖：越温开闭、跨交接责任拆分、同刻测温+交接、未闭合区间、晚到重算、交出方整体拒绝、同刻冲突、幂等重传、并发写入串行化，以及责任确认的快照校验、确认/异议、汇总状态、表态幂等与改口、晚到事件后表态逐片段失效与历史可查等。
+测试覆盖：越温开闭、跨交接责任拆分、同刻测温+交接、未闭合区间、晚到重算、交出方整体拒绝、同刻冲突、幂等重传、并发写入串行化，责任确认的快照校验、确认/异议、汇总状态、表态幂等与改口、晚到事件后表态逐片段失效与历史可查；以及本轮的车次登记、装卸时段左闭右开与跨车次重叠整批拒绝、车载读数仅对在车货物按各自上限越温、同刻自有测温优先（车载原始可查）、交接不被车载读数改变、区间稳定标识 `veh:<读数ID>` 与车载区间表态/失效、车载读数晚到重建、车载写入与受影响货物事件写入的并发串行化。
 
 ## 八、目录结构
 
@@ -257,17 +363,19 @@ DATABASE_URL="sqlite:////tmp/cc.db" \
 .
 ├── app/
 │   ├── main.py            # FastAPI 路由与异常映射
-│   ├── crud.py            # 事件写入事务、幂等、整链校验
-│   ├── stance_crud.py     # 责任表态写入事务（与事件共用货物行锁）
-│   ├── chain.py           # 保管链重建 / 越温责任拆分（纯函数）
+│   ├── crud.py            # 自有事件写入事务、幂等、整链校验
+│   ├── vehicle_crud.py    # 车次 / 装卸时段 / 车载读数写入事务（货物行锁→车次行锁）
+│   ├── stance_crud.py     # 责任表态写入事务（与事件 / 读数共用货物行锁）
+│   ├── timeline.py        # 合并读数时间线（自有事件 + 适用车载读数，同刻自有优先）
+│   ├── chain.py           # 保管链重建 / 越温责任拆分（纯函数，含 veh: 区间标识）
 │   ├── responsibility.py  # 快照标识、表态有效性、确认汇总（纯逻辑）
-│   ├── models.py          # SQLAlchemy 模型（货物 / 事件 / 表态）
+│   ├── models.py          # SQLAlchemy 模型（货物 / 事件 / 车次 / 装卸 / 车载读数 / 表态）
 │   ├── schemas.py         # Pydantic 请求/响应模型
 │   ├── database.py        # 引擎、Session（含 SQLite 兼容）
 │   └── timeutil.py        # UTC 归一化
 ├── db/init.sql            # PostgreSQL 初始化（枚举、表、约束、索引）
-├── examples/              # curl / Python 调用示例（含责任确认完整链路）
-├── tests/                 # pytest 单元 + API + 责任确认 + 并发测试
+├── examples/              # curl / Python 调用示例（含车次与车载测温完整链路）
+├── tests/                 # pytest 单元 + API + 责任确认 + 车次车载 + 并发测试
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

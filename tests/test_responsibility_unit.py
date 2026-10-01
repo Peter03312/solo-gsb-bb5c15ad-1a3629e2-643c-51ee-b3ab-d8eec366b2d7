@@ -4,7 +4,8 @@ from decimal import Decimal
 
 from app import responsibility as resp
 from app.chain import rebuild_chain
-from app.models import Event, EventType, Stance, StanceKind
+from app.chain import interval_id
+from app.models import Event, EventType, IntervalSource, Stance, StanceKind
 
 T0 = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
 
@@ -76,7 +77,9 @@ def test_attested_segments_per_party():
 
 def _stance(party, ex, sid="s1", kind=StanceKind.confirm, reason=None, at=T0):
     return Stance(
-        stance_id=sid, cargo_id="C1", start_event_id=ex.start_event_id,
+        stance_id=sid, cargo_id="C1", interval_key=interval_id(ex),
+        opener_source=IntervalSource.own,
+        start_event_id=ex.start_event_id, vehicle_reading_id=None,
         responsible_party=party, kind=kind, reason=reason,
         snapshot_id=resp.snapshot_id(ex),
         attested_segments=resp.attested_segments_json(ex, party),

@@ -117,3 +117,117 @@ curl -sS -X POST "$BASE/cargo/$C/responsibilities/$IID/stances" \
     \"stance_id\": \"stance-gz-1\"
   }" >/dev/null
 curl -sS "$BASE/cargo/$C/responsibilities/$IID"; echo
+
+echo
+echo "================ 本轮新增：车次 / 装卸时段 / 车载测温 ================"
+# 演示货物：两票同车货物，温度上限不同（C-A 4℃，C-B 8℃）
+CA="COLD-CAR-A"; CB="COLD-CAR-B"; TRIP="TRUCK-DEMO-1"
+for CC in "$CA" "$CB"; do
+  LIM="4.0"; [ "$CC" = "$CB" ] && LIM="8.0"
+  curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+    \"cargo_id\": \"$CC\",
+    \"started_at\": \"2026-09-30T08:00:00+08:00\",
+    \"temp_upper_limit\": \"$LIM\",
+    \"initial_holder\": \"北京冷库\"
+  }" >/dev/null
+done
+
+echo "17) 登记车次（车牌号）"
+curl -sS -X POST "$BASE/trips" -H 'Content-Type: application/json' -d "{
+  \"trip_id\": \"$TRIP\",
+  \"vehicle_no\": \"京B-冷888\",
+  \"note\": \"9月30日 京沪冷链班\"
+}"; echo
+
+echo "18) 批量登记两票货物的装卸时段（左闭右开，同一货物不得跨车次重叠）"
+curl -sS -X POST "$BASE/trips/$TRIP/manifest" \
+  -H 'Content-Type: application/json' -d "{
+    \"items\": [
+      {\"cargo_id\": \"$CA\",
+       \"loaded_at\": \"2026-09-30T09:00:00+08:00\",
+       \"unloaded_at\": \"2026-09-30T18:00:00+08:00\"},
+      {\"cargo_id\": \"$CB\",
+       \"loaded_at\": \"2026-09-30T09:00:00+08:00\",
+       \"unloaded_at\": \"2026-09-30T18:00:00+08:00\"}
+    ]
+  }"; echo
+
+echo "19) 非法时段（起点不早于终点）整批拒绝：422 invalid_loading_window，不留部分记录"
+curl -sS -X POST "$BASE/trips/$TRIP/manifest" \
+  -H 'Content-Type: application/json' -d "{
+    \"items\": [
+      {\"cargo_id\": \"$CA\",
+       \"loaded_at\": \"2026-09-30T19:00:00+08:00\",
+       \"unloaded_at\": \"2026-09-30T19:00:00+08:00\"}
+    ]
+  }"; echo
+
+echo "20) 车载读数 7℃（允许晚到）：回执 affected_cargo_ids 给出读数时刻仍在车上的货物"
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"vr-1\",
+  \"trip_id\": \"$TRIP\",
+  \"read_at\": \"2026-09-30T10:00:00+08:00\",
+  \"temperature\": \"7.0\"
+}"; echo
+
+echo "21) 车载读数幂等重传（同编号同内容 -> 200 replayed）"
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"vr-1\",
+  \"trip_id\": \"$TRIP\",
+  \"read_at\": \"2026-09-30T10:00:00+08:00\",
+  \"temperature\": \"7.0\"
+}"; echo
+
+echo "22) 同刻自有测温优先：$CA 在 11:00 有自有测温 3.1℃，车载 7℃ 读数对其被取代但原始可查"
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"ca-own-1\", \"cargo_id\": \"$CA\",
+  \"occurred_at\": \"2026-09-30T11:00:00+08:00\", \"temperature\": \"3.1\"
+}" >/dev/null
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"vr-2\",
+  \"trip_id\": \"$TRIP\",
+  \"read_at\": \"2026-09-30T11:00:00+08:00\",
+  \"temperature\": \"7.0\"
+}" >/dev/null
+
+echo "23) 交接仍只由货物自有事件改变保管方（12:00 北京冷库 -> 上海冷库，两票货物各写一笔）"
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"ca-h1\", \"cargo_id\": \"$CA\",
+  \"occurred_at\": \"2026-09-30T12:00:00+08:00\",
+  \"giver\": \"北京冷库\", \"receiver\": \"上海冷库\"
+}" >/dev/null
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"cb-h1\", \"cargo_id\": \"$CB\",
+  \"occurred_at\": \"2026-09-30T12:00:00+08:00\",
+  \"giver\": \"北京冷库\", \"receiver\": \"上海冷库\"
+}" >/dev/null
+
+echo "24) 车载 3℃ 读数闭合两票货物的越温区间"
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"vr-3\",
+  \"trip_id\": \"$TRIP\",
+  \"read_at\": \"2026-09-30T14:00:00+08:00\",
+  \"temperature\": \"3.0\"
+}"; echo
+
+echo "25) 车次详情：车载原始读数 + 每笔读数对各货物的适用性 / 是否采用 / 是否越温"
+curl -sS "$BASE/trips/$TRIP" | python3 -m json.tool; echo
+
+echo "26) $CA 合并读数时间线（vr-2 同刻被自有测温取代：adopted=false，原始仍列出）"
+curl -sS "$BASE/cargo/$CA/timeline" | python3 -m json.tool; echo
+
+echo "27) $CA 追责报告：10:00 车载开启越温（区间标识 veh:vr-1），14:00 车载闭合，跨交接拆分"
+curl -sS "$BASE/cargo/$CA/report"; echo
+echo "    $CB 上限 8℃，7℃ 全程不越温："
+curl -sS "$BASE/cargo/$CB/report"; echo
+
+echo "28) 对车载读数开启的区间（veh:vr-1）查询并提交责任表态"
+VSNAP=$(curl -sS "$BASE/cargo/$CA/responsibilities" | python3 -c 'import json,sys; print(json.load(sys.stdin)["intervals"][0]["snapshot_id"])')
+curl -sS -X POST "$BASE/cargo/$CA/responsibilities/veh:vr-1/stances" \
+  -H 'Content-Type: application/json' -d "{
+    \"snapshot_id\": \"$VSNAP\",
+    \"responsible_party\": \"北京冷库\",
+    \"stance\": \"confirm\",
+    \"stance_id\": \"stance-ca-bj-1\"
+  }"; echo
+curl -sS "$BASE/cargo/$CA/responsibilities/veh:vr-1/stances"; echo

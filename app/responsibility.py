@@ -1,5 +1,9 @@
 """已闭合越温区间的责任确认：快照标识、表态有效性与汇总（纯逻辑）。
 
+区间的开启测温可来自**货物自有测温事件**或**车载测温读数**（后者仅对读数
+时刻仍在车上的货物生效，同刻有自有测温时以自有为准）。二者统一在合并读数
+时间线上重建（见 app/timeline.py），区间稳定标识见 app/chain.interval_id。
+
 快照标识
 --------
 区间的“当前快照”由**区间起止**与**责任片段序列**决定：
@@ -10,11 +14,11 @@
 ``[start, end, segments: [[start, end, responsible_party], ...]]``
 排列，时间统一为 UTC ISO 8601（``YYYY-MM-DDTHH:MM:SSZ``）。
 
-表态有效性（晚到事件重建后）
-----------------------------
-表态行只追加、从不修改或删除。晚到的测温 / 交接事件使区间重建后：
+表态有效性（晚到事件 / 晚到车载读数重建后）
+-------------------------------------------
+表态行只追加、从不修改或删除。晚到的测温 / 交接事件或车载读数使区间重建后：
 
-* 区间消失（开启测温不再开启区间）或重新开放 → 该区间全部旧表态失效；
+* 区间消失（开启读数不再开启区间）或重新开放 → 该区间全部旧表态失效；
 * 区间仍在且已闭合、但边界或责任片段变化 → 受影响片段上的旧表态失效，
   未变化片段上的表态继续有效（逐片段判定）；
 * 快照完全不变 → 全部继续有效。
@@ -29,8 +33,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
-from app.chain import ExcursionResult
-from app.models import Event, Stance, StanceKind
+from app.chain import ExcursionResult, interval_id
+from app.models import Stance, StanceKind
 from app.timeutil import ensure_utc
 
 # 汇总状态
@@ -100,8 +104,15 @@ class StanceView:
 @dataclass(frozen=True)
 class IntervalView:
     cargo_id: str
-    start_event_id: str
-    end_event_id: str
+    interval_id: str
+    start_event_id: str | None
+    end_event_id: str | None
+    start_source: str
+    end_source: str
+    start_reading_id: str | None
+    end_reading_id: str | None
+    start_trip_id: str | None
+    end_trip_id: str | None
     start: datetime
     end: datetime
     snapshot_id: str
@@ -122,11 +133,13 @@ def _segments_of_party(ex: ExcursionResult, party: str) -> tuple[SegmentView, ..
 def is_stance_current(stance: Stance, ex: ExcursionResult | None) -> bool:
     """表态是否对当前重建结果仍然有效（逐片段判定）。
 
-    * 区间不存在 / 未闭合 → False；
+    * 区间不存在 / 未闭合 / 区间标识变化（开启读数来源或坐标变化）→ False；
     * 表态时该责任方的片段坐标与当前不一致（边界或责任片段变化）→ False；
-    * 片段坐标完全一致（未受晚到事件影响）→ True。
+    * 区间标识与片段坐标完全一致（未受晚到记录影响）→ True。
     """
     if ex is None or ex.is_open:
+        return False
+    if stance.interval_key != interval_id(ex):
         return False
     return (
         stance.attested_segments
@@ -141,7 +154,8 @@ def build_interval_view(
 ) -> IntervalView:
     """组装单个已闭合区间的责任确认视图。
 
-    ``stances`` 为该区间的全部表态行（含已被改口、已失效的历史行）。
+    ``stances`` 为该区间（按 interval_key 过滤）的全部表态行
+    （含已被改口、已失效的历史行）。
     """
     for s in stances:
         s.created_at = ensure_utc(s.created_at)
@@ -185,8 +199,15 @@ def build_interval_view(
 
     return IntervalView(
         cargo_id=cargo_id,
+        interval_id=interval_id(ex),
         start_event_id=ex.start_event_id,
         end_event_id=ex.end_event_id,
+        start_source=ex.start_source,
+        end_source=ex.end_source,
+        start_reading_id=ex.start_reading_id,
+        end_reading_id=ex.end_reading_id,
+        start_trip_id=ex.start_trip_id,
+        end_trip_id=ex.end_trip_id,
         start=ex.start,
         end=ex.end,
         snapshot_id=snapshot_id(ex),
@@ -204,18 +225,27 @@ def build_interval_view(
 
 def rebuild(
     cargo,
-    events: list[Event],
+    own_events,
+    loadings=None,
+    vehicle_readings=None,
 ) -> tuple[object, dict[str, ExcursionResult]]:
-    """重建保管链并返回（重建结果, 区间标识 -> 闭合区间）。
+    """在合并读数时间线上重建保管链，返回（重建结果, 区间标识 -> 闭合区间）。
 
-    延迟导入以避免与 crud 形成导入环。
+    ``own_events`` 为货物自有事件；``loadings`` / ``vehicle_readings``
+    为该货物的装卸时段与相关车载读数（缺省时退化为仅自有事件，兼容旧调用）。
     """
-    from app import chain
+    from app import chain, timeline
 
+    if loadings is None or vehicle_readings is None:
+        items = list(own_events)
+    else:
+        items = timeline.adopted_timeline(
+            own_events, vehicle_readings, loadings
+        )
     result = chain.rebuild_chain(
-        cargo.initial_holder, Decimal(cargo.temp_upper_limit), events
+        cargo.initial_holder, Decimal(cargo.temp_upper_limit), items
     )
     closed = {
-        ex.start_event_id: ex for ex in result.excursions if not ex.is_open
+        interval_id(ex): ex for ex in result.excursions if not ex.is_open
     }
     return result, closed
