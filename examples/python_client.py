@@ -190,6 +190,202 @@ def main() -> None:
             api.get(f"/cargo/{CARGO}/responsibilities/{iid}"),
         )
 
+        # ========================================
+        # 本轮新增：车次 + 装卸时段 + 车载测温读数
+        # ========================================
+        cargo2 = "COLD-DEMO-4"
+        trip = "TRUCK-DEMO-2"
+
+        show(
+            "创建第二票货物（温度上限 2℃，起始保管方 成都冷库）",
+            api.post(
+                "/cargo",
+                json={
+                    "cargo_id": cargo2,
+                    "started_at": "2026-09-30T08:00:00+08:00",
+                    "temp_upper_limit": "2.0",
+                    "initial_holder": "成都冷库",
+                },
+            ),
+        )
+        show(
+            "登记冷链车次",
+            api.post("/trips", json={"trip_id": trip, "vehicle_no": "沪D-66888"}),
+        )
+
+        # 装卸时段左闭右开：两票货物同车，C2 在 13:00 已卸车
+        show(
+            "批量登记装卸时段（整体成功或整体拒绝）",
+            api.post(
+                f"/trips/{trip}/manifest",
+                json={
+                    "items": [
+                        {
+                            "cargo_id": CARGO,
+                            "loaded_at": "2026-09-30T09:00:00+08:00",
+                            "unloaded_at": "2026-09-30T18:00:00+08:00",
+                        },
+                        {
+                            "cargo_id": cargo2,
+                            "loaded_at": "2026-09-30T09:00:00+08:00",
+                            "unloaded_at": "2026-09-30T13:00:00+08:00",
+                        },
+                    ]
+                },
+            ),
+        )
+
+        # 非法窗口（起点不早于终点）-> 422，整批拒绝不留部分记录
+        show(
+            "非法装卸时段（起点=终点，拒绝）",
+            api.post(
+                f"/trips/{trip}/manifest",
+                json={
+                    "items": [
+                        {
+                            "cargo_id": cargo2,
+                            "loaded_at": "2026-09-30T12:00:00+08:00",
+                            "unloaded_at": "2026-09-30T12:00:00+08:00",
+                        }
+                    ]
+                },
+            ),
+        )
+
+        # 3.0℃：CARGO（限4）不越温；cargo2（限2）越温 -> 开启其区间
+        show(
+            "车载读数 11:00=3.0℃（仅低温货越温）",
+            api.post(
+                f"/trips/{trip}/readings",
+                json={
+                    "reading_id": "rd-1100",
+                    "read_at": "2026-09-30T11:00:00+08:00",
+                    "temperature": "3.0",
+                },
+            ),
+        )
+        # 1.5℃：cargo2 首次不超限 -> 闭合；读数允许晚到
+        show(
+            "车载读数 11:30=1.5℃（闭合低温货区间，可晚到）",
+            api.post(
+                f"/trips/{trip}/readings",
+                json={
+                    "reading_id": "rd-1130",
+                    "read_at": "2026-09-30T11:30:00+08:00",
+                    "temperature": "1.5",
+                },
+            ),
+        )
+        # 13:00（右开边界）：cargo2 已卸车不受影响；CARGO 越温开启区间
+        show(
+            "车载读数 13:00=9.0℃（C2 已下车，仅高温货受影响）",
+            api.post(
+                f"/trips/{trip}/readings",
+                json={
+                    "reading_id": "rd-1300",
+                    "read_at": "2026-09-30T13:00:00+08:00",
+                    "temperature": "9.0",
+                },
+            ),
+        )
+        # 同刻自有测温 2℃ 优先采用，车载 8℃ 被遮蔽但原始读数仍可查
+        # （选 16:30：避开本示例前面 15:00 的自有恢复测温）
+        show(
+            "车载读数 16:30=8.0℃（稍后会有同刻自有测温遮蔽它）",
+            api.post(
+                f"/trips/{trip}/readings",
+                json={
+                    "reading_id": "rd-1630",
+                    "read_at": "2026-09-30T16:30:00+08:00",
+                    "temperature": "8.0",
+                },
+            ),
+        )
+        show(
+            "同刻货物自有测温 2.0℃（自有值优先，车载 8℃ 被遮蔽）",
+            api.post(
+                "/events",
+                json={
+                    "event_id": "p-own-1630",
+                    "cargo_id": CARGO,
+                    "occurred_at": "2026-09-30T16:30:00+08:00",
+                    "temperature": "2.0",
+                },
+            ),
+        )
+        # 13:00 的 9℃ 对 CARGO 开启了车载区间，16:30 同刻自有 2℃ 将其闭合
+
+        show(
+            "车次读数（原始读数 + 各货物采用/越温情况）",
+            api.get(f"/trips/{trip}/readings"),
+        )
+        show(
+            "低温货合并测温时间线（含来源与 adopted 标记）",
+            api.get(f"/cargo/{cargo2}/readings"),
+        )
+        show(
+            "低温货追责报告（区间由车载读数开启/闭合，保管方仍由自有交接决定）",
+            api.get(f"/cargo/{cargo2}/report"),
+        )
+
+        # 车载读数开启的区间同样可以责任确认：标识 trip:<车次>:reading:<读数>
+        resp = api.get(f"/cargo/{cargo2}/responsibilities")
+        show("低温货责任确认列表", resp)
+        intervals = resp.json().get("intervals", [])
+        if intervals:
+            iv = intervals[0]
+            print(
+                f"车载区间标识={iv['interval_id']} "
+                f"开启来源={iv['start_source']} 快照={iv['snapshot_id']}"
+            )
+            show(
+                "成都冷库 对车载区间确认担责",
+                api.post(
+                    f"/cargo/{cargo2}/responsibilities/{iv['interval_id']}/stances",
+                    json={
+                        "snapshot_id": iv["snapshot_id"],
+                        "responsible_party": "成都冷库",
+                        "stance": "confirm",
+                        "stance_id": "py-stance-cd",
+                    },
+                ),
+            )
+            show(
+                "车载区间表态历史",
+                api.get(
+                    f"/cargo/{cargo2}/responsibilities/"
+                    f"{iv['interval_id']}/stances"
+                ),
+            )
+
+        # 幂等 / 冲突
+        show(
+            "车载读数同编号同内容重传（200 replayed）",
+            api.post(
+                f"/trips/{trip}/readings",
+                json={
+                    "reading_id": "rd-1100",
+                    "read_at": "2026-09-30T11:00:00+08:00",
+                    "temperature": "3.0",
+                },
+            ),
+        )
+        show(
+            "车载读数同编号异内容（409 reading_id_conflict）",
+            api.post(
+                f"/trips/{trip}/readings",
+                json={
+                    "reading_id": "rd-1100",
+                    "read_at": "2026-09-30T11:00:00+08:00",
+                    "temperature": "3.5",
+                },
+            ),
+        )
+        show(
+            "货物事件列表只含自有事件（不含车载读数）",
+            api.get(f"/cargo/{CARGO}/events"),
+        )
+
 
 if __name__ == "__main__":
     main()

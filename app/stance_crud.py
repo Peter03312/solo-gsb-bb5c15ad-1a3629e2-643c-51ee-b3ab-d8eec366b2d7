@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app import responsibility as resp
-from app.crud import ApiError, _load_cargo_locked, _load_events
+from app.crud import ApiError, _load_cargo_locked
 from app.models import Stance, StanceKind
 from app.schemas import StanceCreate
 
@@ -39,30 +39,29 @@ def _unprocessable(message: str, code: str) -> ApiError:
 
 
 def _rebuild_closed(db, cargo: Cargo):
-    """持锁/读事务内重建事件链，返回 (chain结果, 闭合区间映射)。"""
-    events = _load_events(db, cargo.cargo_id)
-    return resp.rebuild(cargo, events)
+    """持锁/读事务内重建合并时间线，返回 (chain结果, 闭合区间映射)。"""
+    return resp.rebuild_cargo(db, cargo)
 
 
-def _resolve_interval(db, cargo: Cargo, start_event_id: str, require_closed: bool = True):
-    """按区间标识（开启测温事件ID）定位当前区间。"""
+def _resolve_interval(db, cargo: Cargo, interval_id: str, require_closed: bool = True):
+    """按稳定区间标识（自有测温事件ID 或 trip:...:reading:...）定位当前区间。"""
     result, closed = _rebuild_closed(db, cargo)
-    ex = closed.get(start_event_id)
+    ex = closed.get(interval_id)
     if ex is not None:
         return result, ex
-    # 可能是开放区间
+    # 可能是开放区间（车载读数开启的开放区间同样按稳定标识可查）
     if require_closed and any(
-        e.start_event_id == start_event_id for e in result.excursions
+        e.interval_id == interval_id for e in result.excursions
     ):
         raise _unprocessable(
-            f"区间 {start_event_id} 尚未闭合，开放区间不接受责任表态",
+            f"区间 {interval_id} 尚未闭合，开放区间不接受责任表态",
             code="interval_open",
         )
     raise ApiError(
         404,
         "interval_not_found",
-        f"货物 {cargo.cargo_id} 不存在以测温事件 {start_event_id} "
-        "开启的已闭合越温区间",
+        f"货物 {cargo.cargo_id} 不存在标识为 {interval_id} "
+        "的已闭合越温区间",
     )
 
 
@@ -112,7 +111,7 @@ def _same_stance_content(
     """逐字段比对（stance_id 已相同）。"""
     return (
         existing.cargo_id == cargo_id
-        and existing.start_event_id == interval_id
+        and existing.interval_id == interval_id
         and existing.responsible_party == payload.responsible_party
         and StanceKind(existing.kind) is kind
         and (existing.reason or None)
@@ -137,7 +136,8 @@ def _submit_stance_tx(db, cargo_id: str, interval_id: str, payload: StanceCreate
         # 与事件写入串行化：先锁货物行
         cargo = _load_cargo_locked(db, cargo_id)
 
-        # 幂等优先：已存表态编号，同内容返回原记录（即使快照已失效）
+        # 幂等最优先：已存表态编号，同内容返回原记录——
+        # 即使该区间随后消失 / 重新开放（快照失效）也不做区间校验
         existing = db.get(Stance, payload.stance_id)
         if existing is not None:
             if _same_stance_content(existing, cargo_id, interval_id, payload, kind):
@@ -149,7 +149,7 @@ def _submit_stance_tx(db, cargo_id: str, interval_id: str, payload: StanceCreate
                 code="stance_id_conflict",
             )
 
-        # 以当前事件链定位区间（不存在 / 开放 一律拒绝）
+        # 新表态：以当前合并时间线定位区间（不存在 / 开放 一律拒绝）
         _, ex = _resolve_interval(db, cargo, interval_id)
 
         # 快照校验：必须针对当前快照表态
@@ -174,7 +174,7 @@ def _submit_stance_tx(db, cargo_id: str, interval_id: str, payload: StanceCreate
         stance = Stance(
             stance_id=payload.stance_id,
             cargo_id=cargo_id,
-            start_event_id=interval_id,
+            interval_id=interval_id,
             responsible_party=payload.responsible_party,
             kind=kind,
             reason=payload.reason if kind is StanceKind.dispute else None,

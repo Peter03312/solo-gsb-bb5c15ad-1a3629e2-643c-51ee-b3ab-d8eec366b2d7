@@ -52,21 +52,69 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_event_cargo_time_handover
     ON event (cargo_id, occurred_at)
     WHERE event_type = 'handover';
 
+-- 冷链车次
+CREATE TABLE IF NOT EXISTS trip (
+    trip_id      VARCHAR(64)   PRIMARY KEY,
+    vehicle_no   VARCHAR(64),
+    created_at   TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+
+-- 货物在车次上的装卸时段（左闭右开：loaded_at <= 读数时刻 < unloaded_at）
+CREATE TABLE IF NOT EXISTS trip_manifest (
+    trip_id       VARCHAR(64)  NOT NULL
+                    REFERENCES trip(trip_id) ON DELETE RESTRICT,
+    cargo_id      VARCHAR(64)  NOT NULL
+                    REFERENCES cargo(cargo_id) ON DELETE RESTRICT,
+    loaded_at     TIMESTAMPTZ  NOT NULL,
+    unloaded_at   TIMESTAMPTZ  NOT NULL,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+
+    -- 起点必须严格早于终点
+    CONSTRAINT chk_manifest_window CHECK (loaded_at < unloaded_at),
+
+    PRIMARY KEY (trip_id, cargo_id, loaded_at)
+);
+
+-- 同车次同货物同装车时刻只允许登记一次（与主键等价，单独命名便于冲突识别）
+CREATE UNIQUE INDEX IF NOT EXISTS ux_manifest_trip_cargo_loaded
+    ON trip_manifest (trip_id, cargo_id, loaded_at);
+
+-- 跨车次兜底：同一货物任一装车时刻只能登记一次（防无行锁引擎并发穿透）
+CREATE UNIQUE INDEX IF NOT EXISTS ux_manifest_cargo_loaded
+    ON trip_manifest (cargo_id, loaded_at);
+
+-- 查询货物全部在途时段
+CREATE INDEX IF NOT EXISTS ix_manifest_cargo
+    ON trip_manifest (cargo_id, loaded_at, unloaded_at);
+
+-- 车载测温原始读数（允许晚到；作用范围与采用情况查询时计算）
+CREATE TABLE IF NOT EXISTS trip_reading (
+    reading_id   VARCHAR(64)   PRIMARY KEY,
+    trip_id      VARCHAR(64)   NOT NULL
+                   REFERENCES trip(trip_id) ON DELETE RESTRICT,
+    read_at      TIMESTAMPTZ   NOT NULL,
+    temperature  NUMERIC(10,3) NOT NULL,
+    created_at   TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+
+-- 同一车载设备同一时刻至多一笔读数（同时充当车次+时刻查询索引）
+CREATE UNIQUE INDEX IF NOT EXISTS ux_reading_trip_time
+    ON trip_reading (trip_id, read_at);
+
 -- 责任确认表态（只追加：改口产生新编号，历次表态永久保留）
 CREATE TABLE IF NOT EXISTS responsibility_stance (
     stance_id          VARCHAR(64)   PRIMARY KEY,
     cargo_id           VARCHAR(64)   NOT NULL
                          REFERENCES cargo(cargo_id) ON DELETE RESTRICT,
-    -- 区间标识 = 开启该区间的测温事件ID
-    start_event_id     VARCHAR(64)   NOT NULL
-                         REFERENCES event(event_id) ON DELETE RESTRICT,
+    -- 区间稳定标识：自有测温事件ID，或 trip:<车次ID>:reading:<读数ID>
+    interval_id        VARCHAR(160)  NOT NULL,
     responsible_party  VARCHAR(128)  NOT NULL,
     kind               stance_kind   NOT NULL,
     reason             VARCHAR(512),
     -- 提交时校验通过的快照标识（sha256:<hex>）；区间/片段变化后与当前快照不再一致
     snapshot_id        VARCHAR(71)   NOT NULL,
     -- 表态时该责任方承担的片段坐标 JSON（[["起","止","责任方"],...]），
-    -- 晚到事件重建后逐片段判定表态是否仍有效
+    -- 晚到事件/读数重建后逐片段判定表态是否仍有效
     attested_segments  VARCHAR(2000) NOT NULL,
     created_at         TIMESTAMPTZ   NOT NULL DEFAULT now(),
 
@@ -79,4 +127,4 @@ CREATE TABLE IF NOT EXISTS responsibility_stance (
 );
 
 CREATE INDEX IF NOT EXISTS ix_stance_cargo_interval
-    ON responsibility_stance (cargo_id, start_event_id);
+    ON responsibility_stance (cargo_id, interval_id);

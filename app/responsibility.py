@@ -33,6 +33,10 @@ from app.chain import ExcursionResult
 from app.models import Event, Stance, StanceKind
 from app.timeutil import ensure_utc
 
+# 读数来源
+SOURCE_OWN = "own"            # 货物自有测温
+SOURCE_ONBOARD = "onboard"    # 车载读数（读数时刻在车上且无同刻自有测温）
+
 # 汇总状态
 ALL_CONFIRMED = "all_confirmed"  # 全部责任方均已确认
 HAS_DISPUTE = "has_dispute"      # 有效表态中存在异议
@@ -98,10 +102,21 @@ class StanceView:
 
 
 @dataclass(frozen=True)
+class PointRef:
+    """开启 / 闭合越温区间的测温点来源描述。"""
+
+    source: str                      # own / onboard
+    event_id: str | None = None      # 自有测温事件ID
+    trip_id: str | None = None       # 车载读数所属车次
+    reading_id: str | None = None    # 车载读数编号
+
+
+@dataclass(frozen=True)
 class IntervalView:
     cargo_id: str
-    start_event_id: str
-    end_event_id: str
+    interval_id: str
+    start_event_id: str | None
+    end_event_id: str | None
     start: datetime
     end: datetime
     snapshot_id: str
@@ -109,6 +124,8 @@ class IntervalView:
     parties: tuple[str, ...]
     stances: tuple[StanceView, ...]
     summary: str
+    start_source: PointRef
+    end_source: PointRef
 
 
 def _segments_of_party(ex: ExcursionResult, party: str) -> tuple[SegmentView, ...]:
@@ -134,6 +151,17 @@ def is_stance_current(stance: Stance, ex: ExcursionResult | None) -> bool:
     )
 
 
+def _point_ref(point) -> PointRef:
+    if point is None:
+        return PointRef(source=SOURCE_OWN)
+    return PointRef(
+        source=point.source,
+        event_id=point.event_id,
+        trip_id=point.trip_id,
+        reading_id=point.reading_id,
+    )
+
+
 def build_interval_view(
     cargo_id: str,
     ex: ExcursionResult,
@@ -142,6 +170,7 @@ def build_interval_view(
     """组装单个已闭合区间的责任确认视图。
 
     ``stances`` 为该区间的全部表态行（含已被改口、已失效的历史行）。
+    区间标识按稳定规则取：自有测温事件ID 或 trip:<车次>:reading:<读数>。
     """
     for s in stances:
         s.created_at = ensure_utc(s.created_at)
@@ -185,6 +214,7 @@ def build_interval_view(
 
     return IntervalView(
         cargo_id=cargo_id,
+        interval_id=ex.interval_id,
         start_event_id=ex.start_event_id,
         end_event_id=ex.end_event_id,
         start=ex.start,
@@ -199,23 +229,38 @@ def build_interval_view(
         parties=parties,
         stances=tuple(stance_views),
         summary=summary,
+        start_source=_point_ref(ex.start_point),
+        end_source=_point_ref(ex.end_point),
     )
 
 
 def rebuild(
     cargo,
     events: list[Event],
+    onboard_points=None,
 ) -> tuple[object, dict[str, ExcursionResult]]:
-    """重建保管链并返回（重建结果, 区间标识 -> 闭合区间）。
+    """重建保管链并返回（重建结果, 区间稳定标识 -> 闭合区间）。
 
-    延迟导入以避免与 crud 形成导入环。
+    ``onboard_points`` 为已按装卸时段投影到本货物的车载测温点；
+    自有测温与车载读数同刻时，链重建内部自动以自有值优先。
     """
     from app import chain
 
     result = chain.rebuild_chain(
-        cargo.initial_holder, Decimal(cargo.temp_upper_limit), events
+        cargo.initial_holder,
+        Decimal(cargo.temp_upper_limit),
+        events,
+        onboard_points=onboard_points,
     )
     closed = {
-        ex.start_event_id: ex for ex in result.excursions if not ex.is_open
+        ex.interval_id: ex for ex in result.excursions if not ex.is_open
     }
     return result, closed
+
+
+def rebuild_cargo(db, cargo) -> tuple[object, dict[str, ExcursionResult]]:
+    """从数据库加载自有事件 + 车载点后重建（持锁 / 读事务内调用）。"""
+    from app import crud
+
+    events, points = crud.merged_timeline(db, cargo)
+    return rebuild(cargo, events, onboard_points=points)

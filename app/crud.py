@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app import chain
-from app.models import Cargo, Event, EventType
+from app.models import Cargo, Event, EventType, TripManifest, TripReading
 from app.schemas import CargoCreate, EventCreate
 from app.timeutil import ensure_utc
 
@@ -198,3 +198,77 @@ def create_event(db, payload: EventCreate) -> WriteResult:
         )
 
     return WriteResult(event=candidate, replayed=False)
+
+
+# ------------------------------------------------------- 车次 / 车载读数读取
+
+
+def _load_manifests(db, cargo_id: str) -> list[TripManifest]:
+    """货物的全部装卸时段。"""
+    stmt = select(TripManifest).where(TripManifest.cargo_id == cargo_id)
+    rows = list(db.scalars(stmt).all())
+    for m in rows:
+        m.loaded_at = ensure_utc(m.loaded_at)
+        m.unloaded_at = ensure_utc(m.unloaded_at)
+    return rows
+
+
+def _load_all_manifests(db) -> list[TripManifest]:
+    rows = list(db.scalars(select(TripManifest)).all())
+    for m in rows:
+        m.loaded_at = ensure_utc(m.loaded_at)
+        m.unloaded_at = ensure_utc(m.unloaded_at)
+    return rows
+
+
+def onboard_points_for_cargo(
+    manifests: list[TripManifest],
+    readings: list[TripReading],
+    started_at=None,
+) -> list[chain.ReadingPoint]:
+    """按装卸时段把车载读数投影到一票货物的时间线（左闭右开）。
+
+    早于货物起始时间的读数不进入时间线；同刻自有测温的遮蔽在
+    ``chain.rebuild_chain`` 去重时处理（本函数保留全部候选点，
+    供查询接口区分 adopted / superseded）。
+    """
+    points: list[chain.ReadingPoint] = []
+    for r in readings:
+        at = ensure_utc(r.read_at)
+        if started_at is not None and at < started_at:
+            continue
+        if any(m.loaded_at <= at < m.unloaded_at for m in manifests):
+            points.append(
+                chain.ReadingPoint(
+                    at=at,
+                    temperature=r.temperature,
+                    source="onboard",
+                    trip_id=r.trip_id,
+                    reading_id=r.reading_id,
+                )
+            )
+    return points
+
+
+def merged_timeline(db, cargo: Cargo, events: list[Event] | None = None):
+    """加载一票货物的自有事件 + 可作用的车载测温点（合并重建输入）。
+
+    返回 (events, onboard_points)。
+    """
+    if events is None:
+        events = _load_events(db, cargo.cargo_id)
+    manifests = _load_manifests(db, cargo.cargo_id)
+    if not manifests:
+        return events, []
+    trip_ids = {m.trip_id for m in manifests}
+    readings = list(
+        db.scalars(
+            select(TripReading).where(TripReading.trip_id.in_(trip_ids))
+        ).all()
+    )
+    for r in readings:
+        r.read_at = ensure_utc(r.read_at)
+    points = onboard_points_for_cargo(
+        manifests, readings, started_at=cargo.started_at
+    )
+    return events, points
